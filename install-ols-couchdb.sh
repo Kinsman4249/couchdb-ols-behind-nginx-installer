@@ -41,7 +41,6 @@ fi
 normalize_http2() {
   local f="$1"
   [ "${HTTP2_MODERN}" -eq 1 ] && return 0
-  # Append http2 to the 443 listen lines and delete the standalone directive.
   sed -i \
     -e 's/^\(\s*\)listen \(\[::\]:\)\{0,1\}443 ssl\( default_server\)\{0,1\};/\1listen \2443 ssl\3 http2;/' \
     -e '/^[[:space:]]*http2 on;/d' \
@@ -62,17 +61,27 @@ while [ -z "${DOMAIN}" ]; do
 done
 DOMAIN="$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]')"
 
-# --- CouchDB credentials --------------------------------------------------
-read -r -p "CouchDB admin username [obsidian]: " CDB_USER
-CDB_USER="${CDB_USER:-obsidian}"
-
+# --- CouchDB admin password -----------------------------------------------
+# NOTE: the CouchDB Debian package always creates an admin account literally
+# named "admin". debconf only lets us set that account's PASSWORD, not its
+# name. So this password belongs to the "admin" user. If you want an
+# additional admin under a different name, answer the later prompt.
+echo
+echo "The CouchDB Debian package creates a server admin named 'admin'."
+echo "Set that admin's password now."
 CDB_PASS=""
 while [ -z "${CDB_PASS}" ]; do
-  read -r -p "CouchDB admin password: " CDB_PASS
+  read -r -p "CouchDB 'admin' password: " CDB_PASS
 done
 
 read -r -p "Vault database name for the plugin [obsidiannotes]: " CDB_DB
 CDB_DB="${CDB_DB:-obsidiannotes}"
+
+# Optional: an additional admin account under a name you choose.
+echo
+echo "Optionally create an ADDITIONAL admin account under a name of your"
+echo "choice (same password as above). Leave blank to use only 'admin'."
+read -r -p "Extra admin username (blank for none): " EXTRA_ADMIN
 
 # --- Optional extra nginx includes ---------------------------------------
 echo
@@ -168,6 +177,7 @@ CDB_COOKIE="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24
 
 BIND_ADDR="127.0.0.1"   # localhost only; nginx is the sole public door.
 PORT="5984"
+ADMIN_USER="admin"      # fixed by the CouchDB Debian package; not configurable.
 
 # ==========================================================================
 # 1. Apache CouchDB repository (Debian)
@@ -183,9 +193,10 @@ echo "deb [signed-by=/usr/share/keyrings/couchdb-archive-keyring.gpg] https://ap
   | tee /etc/apt/sources.list.d/couchdb.list >/dev/null
 
 # ==========================================================================
-# 2. Pre-seed debconf: standalone, localhost-bound, admin set.
-#    CouchDB 3.x will not start without an admin. If a key differs on your
-#    release, apt falls back to prompting; answer with the printed values.
+# 2. Pre-seed debconf: standalone, localhost-bound, admin password set.
+#    The admin account name is always "admin" (package default); debconf has
+#    no field for the admin username. If a key differs on your release, apt
+#    falls back to prompting; answer with the printed values.
 # ==========================================================================
 apt-get update
 export DEBIAN_FRONTEND=noninteractive
@@ -208,26 +219,39 @@ sleep 3
 echo "--- Sockets on :${PORT} (must be ${BIND_ADDR}, not 0.0.0.0) ---"
 ss -tlnp | grep ":${PORT}" || true
 
-echo "--- Auth check ---"
-curl -s "http://${CDB_USER}:${CDB_PASS}@${BIND_ADDR}:${PORT}/" || true
-echo
+echo "--- Auth check (as ${ADMIN_USER}) ---"
+curl -s -o /dev/null -w "HTTP %{http_code}\n" \
+  "http://${ADMIN_USER}:${CDB_PASS}@${BIND_ADDR}:${PORT}/_node/_local/_config/admins" || true
 
 # ==========================================================================
 # 4. Maintainer init script (CORS, Obsidian origins, require_valid_user...).
+#    Authenticate as "admin". This account is guaranteed to exist; using a
+#    non-existent username here causes every config PUT to 401 silently, which
+#    leaves the plugin reporting all settings as wrong.
 # ==========================================================================
 export hostname="${BIND_ADDR}:${PORT}"
-export username="${CDB_USER}"
+export username="${ADMIN_USER}"
 export password="${CDB_PASS}"
 curl -s https://raw.githubusercontent.com/vrtmrz/obsidian-livesync/main/utils/couchdb/couchdb-init.sh | bash
 
 # ==========================================================================
-# 5. Create the vault database.
+# 5. Optionally create an additional admin under the chosen name.
 # ==========================================================================
-curl -s -X PUT "http://${CDB_USER}:${CDB_PASS}@${BIND_ADDR}:${PORT}/${CDB_DB}" || true
-echo
+if [ -n "${EXTRA_ADMIN}" ]; then
+  echo "Creating additional admin '${EXTRA_ADMIN}'..."
+  curl -s -o /dev/null -w "create admin ${EXTRA_ADMIN}: HTTP %{http_code}\n" \
+    -X PUT "http://${ADMIN_USER}:${CDB_PASS}@${BIND_ADDR}:${PORT}/_node/_local/_config/admins/${EXTRA_ADMIN}" \
+    --data-raw "\"${CDB_PASS}\"" || true
+fi
 
 # ==========================================================================
-# 6. nginx: rate-limit fragment + rendered SNI vhost.
+# 6. Create the vault database (as admin).
+# ==========================================================================
+curl -s -o /dev/null -w "create db ${CDB_DB}: HTTP %{http_code}\n" \
+  -X PUT "http://${ADMIN_USER}:${CDB_PASS}@${BIND_ADDR}:${PORT}/${CDB_DB}" || true
+
+# ==========================================================================
+# 7. nginx: rate-limit fragment + rendered SNI vhost.
 # ==========================================================================
 NGX_CONFD="/etc/nginx/conf.d"
 NGX_AVAIL="/etc/nginx/sites-available"
@@ -250,7 +274,7 @@ awk -v d="${DOMAIN}" -v c="${SSL_CERT}" -v k="${SSL_KEY}" \
 normalize_http2 "${NGX_AVAIL}/obsidian-livesync"
 
 # ==========================================================================
-# 7. Enable the vhost only if the cert and key exist.
+# 8. Enable the vhost only if the cert and key exist.
 # ==========================================================================
 if [ -f "${SSL_CERT}" ] && [ -f "${SSL_KEY}" ]; then
   ln -sf "${NGX_AVAIL}/obsidian-livesync" "${NGX_ENABL}/obsidian-livesync"
@@ -269,7 +293,7 @@ else
 fi
 
 # ==========================================================================
-# 8. Optional 444 default_server drop for unknown SNI / raw-IP on 443.
+# 9. Optional 444 default_server drop for unknown SNI / raw-IP on 443.
 # ==========================================================================
 read -r -p "Install 444 default_server drop for unknown SNI? [y/N]: " DO_DROP
 DO_DROP="${DO_DROP:-N}"
@@ -284,23 +308,26 @@ if [[ "${DO_DROP}" =~ ^[Yy] ]]; then
 fi
 
 # ==========================================================================
-# 9. Summary. WRITE THESE DOWN.
+# 10. Summary. WRITE THESE DOWN.
 # ==========================================================================
+PLUGIN_USER="${ADMIN_USER}"
+[ -n "${EXTRA_ADMIN}" ] && PLUGIN_USER="${ADMIN_USER} (or ${EXTRA_ADMIN})"
 cat <<SUMMARY
 
 ============================================================
   WRITE THESE DOWN
 ============================================================
   Sync URL (plugin) : https://${DOMAIN}
-  CouchDB admin user: ${CDB_USER}
+  CouchDB admin user: ${ADMIN_USER}   (fixed by the Debian package)
   CouchDB admin pass: ${CDB_PASS}
+  Extra admin user  : ${EXTRA_ADMIN:-<none>}
   Vault DB name     : ${CDB_DB}
   Bind address      : ${BIND_ADDR}:${PORT}  (localhost only)
   Erlang cookie     : ${CDB_COOKIE}
 
   Obsidian Self-hosted LiveSync plugin:
     URI      : https://${DOMAIN}
-    Username : ${CDB_USER}
+    Username : ${PLUGIN_USER}
     Password : ${CDB_PASS}
     Database : ${CDB_DB}
   Set an End-to-End encryption passphrase in the plugin. The server

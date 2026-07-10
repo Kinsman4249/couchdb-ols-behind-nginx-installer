@@ -5,7 +5,7 @@ Native (no-Docker) CouchDB backend for Obsidian Self-hosted LiveSync on Debian, 
 ## What it sets up
 
 - CouchDB installed natively from the Apache Debian repository, bound to 127.0.0.1:5984 only. nginx is the sole public entry point.
-- CouchDB admin created at install time (CouchDB 3.x will not start without one).
+- CouchDB admin account created at install time. The Debian package always names this account admin and only its password is configurable; the installer can optionally create an additional admin under a name you choose.
 - The maintainer's couchdb-init.sh applied (enables CORS, sets the Obsidian allowed origins, require_valid_user, max_document_size).
 - The vault database created and ready.
 - An nginx SNI vhost on 443 that proxies to CouchDB, with:
@@ -49,7 +49,8 @@ Answer the prompts. The script prints a summary of everything you need to write 
 Install the Self-hosted LiveSync community plugin and set:
 
 - URI: https:// followed by the hostname you chose
-- Username and Password: the CouchDB admin credentials from the install summary
+- Username: admin (the account the CouchDB Debian package creates), or the extra admin name if you chose to create one
+- Password: the admin password from the install summary
 - Database: the vault database name from the summary
 - Set an End-to-End encryption passphrase. The server never sees it. Record it separately.
 
@@ -103,7 +104,7 @@ The enforce snippet returns 403 to any non-Cloudflare client. Because of that:
 
 ## Caveats
 
-- debconf keys for CouchDB (mode, bindaddress, cookie, adminpass) follow the standard Debian package pattern. If a key differs on your release, apt falls back to interactive prompts; answer with the values the script prints.
+- The CouchDB Debian package always creates the server admin under the name admin and debconf only sets that account's password, not its name. The installer therefore applies all server configuration and creates the database while authenticated as admin, and can optionally create an additional admin under a name you choose. Earlier revisions incorrectly assumed the admin username was configurable, which caused the maintainer init script to authenticate as a non-existent user so that no CORS or auth settings were applied; that is fixed.
 - If another service on the same host renews certificates by stopping nginx, that renewal briefly drops all vhosts including this one. LiveSync resyncs automatically afterward.
 - If you place this host behind a proxy with a request body cap, very large single documents can be rejected. LiveSync chunks data, so this is normally fine; keep the plugin chunk size moderate.
 - The nginx vhost templates use the modern http2 directive (http2 on;). The installer detects the running nginx version and, on nginx older than 1.25.1 (for example Debian 12 which ships 1.22), automatically rewrites the vhost to the older listen-parameter form (listen 443 ssl http2;) so the config test passes. This also applies to the optional 444 drop vhost.
