@@ -106,6 +106,7 @@ The enforce snippet returns 403 to any non-Cloudflare client. Because of that:
 - debconf keys for CouchDB (mode, bindaddress, cookie, adminpass) follow the standard Debian package pattern. If a key differs on your release, apt falls back to interactive prompts; answer with the values the script prints.
 - If another service on the same host renews certificates by stopping nginx, that renewal briefly drops all vhosts including this one. LiveSync resyncs automatically afterward.
 - If you place this host behind a proxy with a request body cap, very large single documents can be rejected. LiveSync chunks data, so this is normally fine; keep the plugin chunk size moderate.
+- The nginx vhost templates use the modern http2 directive (http2 on;). The installer detects the running nginx version and, on nginx older than 1.25.1 (for example Debian 12 which ships 1.22), automatically rewrites the vhost to the older listen-parameter form (listen 443 ssl http2;) so the config test passes. This also applies to the optional 444 drop vhost.
 
 ## Sources
 

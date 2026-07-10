@@ -25,10 +25,34 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# --- nginx version / http2 syntax compatibility --------------------------
+# nginx 1.25.1 introduced the standalone "http2 on;" directive. Older nginx
+# (for example Debian 12 ships 1.22) rejects it with: unknown directive "http2".
+# The shipped vhost templates use the modern syntax; normalize_http2() rewrites
+# a rendered vhost to the older "listen ... ssl http2;" form when the detected
+# nginx is older, so the config test passes on both.
+version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
+NGINX_VER="$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9][0-9.]*\).*#\1#p' || true)"
+if [ -n "${NGINX_VER}" ] && version_ge "${NGINX_VER}" "1.25.1"; then
+  HTTP2_MODERN=1
+else
+  HTTP2_MODERN=0
+fi
+normalize_http2() {
+  local f="$1"
+  [ "${HTTP2_MODERN}" -eq 1 ] && return 0
+  # Append http2 to the 443 listen lines and delete the standalone directive.
+  sed -i \
+    -e 's/^\(\s*\)listen \(\[::\]:\)\{0,1\}443 ssl\( default_server\)\{0,1\};/\1listen \2443 ssl\3 http2;/' \
+    -e '/^[[:space:]]*http2 on;/d' \
+    "$f"
+}
+
 echo "============================================================"
 echo "  CouchDB + Obsidian Self-hosted LiveSync installer"
 echo "============================================================"
 echo "All values are prompted. Nothing is hardcoded."
+echo "Detected nginx version: ${NGINX_VER:-unknown} (modern http2 syntax: $([ "${HTTP2_MODERN}" -eq 1 ] && echo yes || echo no))"
 echo
 
 # --- Hostname (required, no default) --------------------------------------
@@ -222,6 +246,9 @@ awk -v d="${DOMAIN}" -v c="${SSL_CERT}" -v k="${SSL_KEY}" \
   print
 }' "${SCRIPT_DIR}/nginx/obsidian-livesync.conf" > "${NGX_AVAIL}/obsidian-livesync"
 
+# Rewrite http2 syntax for older nginx if needed.
+normalize_http2 "${NGX_AVAIL}/obsidian-livesync"
+
 # ==========================================================================
 # 7. Enable the vhost only if the cert and key exist.
 # ==========================================================================
@@ -250,6 +277,7 @@ if [[ "${DO_DROP}" =~ ^[Yy] ]]; then
   apt-get install -y ssl-cert
   install -m 0644 "${SCRIPT_DIR}/nginx/00-tls-default-drop.conf" \
     "${NGX_AVAIL}/00-tls-default-drop"
+  normalize_http2 "${NGX_AVAIL}/00-tls-default-drop"
   ln -sf "${NGX_AVAIL}/00-tls-default-drop" "${NGX_ENABL}/00-tls-default-drop"
   nginx -t && systemctl reload nginx || \
     echo "nginx -t failed after adding drop vhost; review it."
